@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <time.h>
@@ -32,6 +33,7 @@
 #include <dirent.h>
 #include <string.h>
 #include <errno.h>
+#include <libgen.h>
 #ifdef __MINGW32__
 #include <windows.h>
 #else
@@ -55,8 +57,67 @@
 /* Sigh... KOS treats anything under 100 as invalid for a dirent from dcload, so
    we need to offset by a bit. This aught to do. */
 #define DIRENT_OFFSET   1337
+#define MAX_PATH_LEN 4096
+
+#ifdef _WIN32
+#define realpath(N,R) _fullpath((R),(N),PATH_MAX)
+#endif
 
 static DIR *opendirs[MAX_OPEN_DIRS];
+static char *mappath = NULL;
+static int mappatlen = -1;
+
+static char path_work_buffer[MAX_PATH_LEN];
+static char path_result_buffer[MAX_PATH_LEN];
+void set_mappath(char *path) {
+  mappath = path;
+  mappatlen = strlen(mappath);
+  strcpy(path_work_buffer, mappath);
+}
+
+/**
+ * map_path - Wrapper method for use in chroot and mapping modes.
+ *          If the static mappath hasn't been set chroot mode is assumed,
+ *          otherwise paths are checked with realpath and mapped to the
+ *          mappath directory.
+ *
+ * @param path The path to map as seen from the Dreamcast (ie. /pc/<path> )
+ * @param check_only_dirname If true, realpath is called on the dirname of the path
+ * @return The mapped path or NULL if the resolved path is outside of the
+ *         mappath directory.
+ */
+static inline char *map_path(char *path, int check_only_dirname) {
+  if (!mappath)
+    return path;
+
+  if (check_only_dirname) {
+    // dirname alters the input string, so use a copy
+    char dnamebuf[MAX_PATH_LEN]; 
+    strcpy(dnamebuf, path);
+    strcpy(path_work_buffer + mappatlen, dirname(dnamebuf));
+  } else {
+    strcpy(path_work_buffer + mappatlen, path);
+  }
+  if (realpath(path_work_buffer, path_result_buffer) == NULL) {
+    printf("Failed to map path '%s' with error: %s\n", path_work_buffer,
+           strerror(errno));
+    return NULL;
+  }
+  
+  if (strncmp(mappath, path_result_buffer, mappatlen) != 0) {
+      printf("Requested path:\n\t%s\n"
+        "is outside of basepath:\n\t%s\n",
+        mappath, path_result_buffer);
+        return NULL;
+  }
+  if (check_only_dirname) {
+    // append the basename of the path to the result buffer
+    int reslen = strlen(path_result_buffer);
+    path_result_buffer[reslen] = '/';
+    strcpy(path_result_buffer + reslen +1, basename(path));
+  }
+  return path_result_buffer;
+}
 
 /* syscalls for dcload-ip
  *
@@ -129,10 +190,10 @@ int dc_write(unsigned char * buffer)
       unsigned int *exception_frame_uints = (unsigned int*)data;
 
       printf("\n\n");
-      printf(exception_code_to_string(exception_frame->expt_code));
+      printf("%s", exception_code_to_string(exception_frame->expt_code));
       for(unsigned int regdump = 0; regdump < 66; regdump++)
       {
-        printf(exception_label_array[regdump]);
+        printf("%s", exception_label_array[regdump]);
         printf(": 0x%x\n", exception_frame_uints[regdump + 2]);
       }
 
@@ -198,8 +259,8 @@ int dc_open(unsigned char * buffer)
     ourflags |= O_TRUNC;
   if (ntohl(command->value0) & 0x0800)
     ourflags |= O_EXCL;
-
-  retval = open(command->string, ourflags | O_BINARY, ntohl(command->value1));
+  retval = open(map_path(command->string, 1), ourflags | O_BINARY,
+                ntohl(command->value1));
 
   send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
 
@@ -223,34 +284,35 @@ int dc_creat(unsigned char * buffer)
     int retval;
     command_int_string_t *command = (command_int_string_t *)buffer;
 
-    retval = creat(command->string, ntohl(command->value0));
-
-    send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
-
-    return 0;
+  retval = creat(map_path(command->string, 1), ntohl(command->value0));
+  send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
+  return 0;
 }
 
-int dc_link(unsigned char * buffer)
-{
-    char *pathname1, *pathname2;
-    int retval;
-    command_string_t *command = (command_string_t *)buffer;
+int dc_link(unsigned char *buffer) {
+  int retval;
+  command_string_t *command = (command_string_t *)buffer;
+  char local_buffer[MAX_PATH_LEN];
 
-    pathname1 = command->string;
-    pathname2 = &command->string[strlen(command->string)+1];
+  const char *local_ref = map_path(command->string, 0);
+  if (mappath) {
+    strcpy(local_buffer, local_ref);
+  }
 
 #ifdef __MINGW32__
-    /* Copy the file on Windows */
-    retval = CopyFileA(pathname1, pathname2, 0);
+  /* Copy the file on Windows */
+  retval =
+      CopyFileA(local_buffer,
+                map_path(&command->string[strlen(command->string) + 1], 1), 0);
 #else
-    retval = link(pathname1, pathname2);
+  retval = link(local_buffer,
+                map_path(&command->string[strlen(command->string) + 1], 1));
 #endif
 
-    send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
+  send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
 
-    return 0;
+  return 0;
 }
-
 int dc_unlink(unsigned char * buffer)
 {
     int retval;
@@ -268,7 +330,7 @@ int dc_chdir(unsigned char * buffer)
     int retval;
     command_string_t *command = (command_string_t *)buffer;
 
-    retval = chdir(command->string);
+  retval = chdir(map_path(command->string, 0));
 
     send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
 
@@ -280,7 +342,7 @@ int dc_chmod(unsigned char * buffer)
     int retval;
     command_int_string_t *command = (command_int_string_t *)buffer;
 
-    retval = chmod(command->string, ntohl(command->value0));
+  retval = chmod(map_path(command->string, 0), ntohl(command->value0));
 
     send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
 
@@ -315,7 +377,7 @@ int dc_stat(unsigned char * buffer)
     dcload_stat_t dcstat;
     command_2int_string_t *command = (command_2int_string_t *)buffer;
 
-    retval = stat(command->string, &filestat);
+  retval = stat(map_path(command->string, 0), &filestat);
 
     dcstat.st_dev = dc_order(filestat.st_dev);
     dcstat.st_ino = dc_order(filestat.st_ino);
@@ -372,7 +434,7 @@ int dc_opendir(unsigned char * buffer)
     }
 
     if(i < MAX_OPEN_DIRS) {
-        if(!(opendirs[i] = opendir(command->string)))
+    if (!(opendirs[i] = opendir(map_path(command->string, 0))))
             i = 0;
         else
             i += DIRENT_OFFSET;
